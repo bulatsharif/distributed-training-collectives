@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NCCL Collectives and Distributed Training Visual Guide</title>
+    <meta
+      name="description"
+      content="Interactive visual guide to NCCL collectives, distributed training communication, algorithms, topology, and performance tradeoffs."
+    />
+    <meta name="theme-color" content="#f6f7f4" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="NCCL collectives guide home">
+        <span class="brand-mark" aria-hidden="true">Σ</span>
+        <span>NCCL Collectives</span>
+      </a>
+      <nav class="top-nav" aria-label="Main navigation">
+        <a href="#visualizer">Visualizer</a>
+        <a href="#collectives">Collectives</a>
+        <a href="#nccl">NCCL</a>
+        <a href="#training">Training</a>
+        <a href="#debugging">Debugging</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero section-band">
+        <div class="hero-copy">
+          <p class="eyebrow">Interactive guide</p>
+          <h1>NCCL collectives and distributed training, visualized</h1>
+          <p class="lead">
+            Collective communication is the hidden data movement behind data
+            parallel training, FSDP, tensor parallelism, MoE routing, checkpoint
+            sharding, and multi-node GPU jobs. This guide shows what each
+            collective does, how NCCL launches it, and why topology, message
+            size, rank mapping, and overlap decide scaling.
+          </p>
+          <div class="hero-metrics" aria-label="Guide coverage">
+            <div>
+              <strong>9</strong>
+              <span>communication patterns</span>
+            </div>
+            <div>
+              <strong>4</strong>
+              <span>algorithm families</span>
+            </div>
+            <div>
+              <strong>6</strong>
+              <span>training workflows</span>
+            </div>
+          </div>
+        </div>
+        <div class="hero-panel" aria-label="Animated overview">
+          <svg id="hero-network" viewBox="0 0 760 460" role="img" aria-labelledby="hero-title hero-desc">
+            <title id="hero-title">Collective communication overview</title>
+            <desc id="hero-desc">
+              Eight GPU ranks exchange tensor chunks across an interconnect and
+              converge on synchronized data.
+            </desc>
+          </svg>
+        </div>
+      </section>
+
+      <section id="visualizer" class="section-pad visualizer-grid">
+        <div class="section-intro">
+          <p class="eyebrow">Step through the data movement</p>
+          <h2>Collective simulator</h2>
+          <p>
+            Choose a collective, rank count, and algorithm. The diagram shows
+            which ranks exchange chunks at each phase and how buffer ownership
+            changes. The math panel gives the communication shape used for
+            capacity planning.
+          </p>
+        </div>
+
+        <div class="control-surface" aria-label="Collective simulator controls">
+          <label>
+            Collective
+            <select id="collective-select"></select>
+          </label>
+          <label>
+            Algorithm view
+            <select id="algorithm-select"></select>
+          </label>
+          <label>
+            Ranks
+            <input id="rank-slider" type="range" min="2" max="8" value="6" />
+            <output id="rank-output">6</output>
+          </label>
+          <div class="button-row" aria-label="Step controls">
+            <button id="prev-step" class="icon-button" type="button" aria-label="Previous step" title="Previous step">
+              <span aria-hidden="true">‹</span>
+            </button>
+            <button id="play-steps" type="button">Play</button>
+            <button id="next-step" class="icon-button" type="button" aria-label="Next step" title="Next step">
+              <span aria-hidden="true">›</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="simulator-shell">
+          <div class="sim-main">
+            <div class="sim-header">
+              <div>
+                <p class="eyebrow">Current phase</p>
+                <h3 id="step-title">Loading</h3>
+              </div>
+              <div class="step-counter" id="step-counter">0 / 0</div>
+            </div>
+            <svg id="collective-svg" viewBox="0 0 900 620" role="img" aria-labelledby="sim-title sim-desc">
+              <title id="sim-title">Collective simulator diagram</title>
+              <desc id="sim-desc">
+                GPU ranks arranged in a ring, with arrows showing active
+                communication and chunk bars showing buffer contents.
+              </desc>
+            </svg>
+            <div class="timeline" id="timeline" aria-label="Step timeline"></div>
+          </div>
+          <aside class="sim-aside">
+            <div>
+              <p class="eyebrow">What is happening</p>
+              <p id="step-detail" class="detail-text"></p>
+            </div>
+            <div class="metric-grid" id="metric-grid"></div>
+            <div>
+              <p class="eyebrow">Mental model</p>
+              <p id="collective-summary" class="detail-text"></p>
+            </div>
+            <div>
+              <p class="eyebrow">Common training use</p>
+              <p id="training-use" class="detail-text"></p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="collectives" class="section-pad">
+        <div class="section-intro wide">
+          <p class="eyebrow">Primitive vocabulary</p>
+          <h2>The collectives you see in GPU training</h2>
+          <p>
+            A collective is a matched operation over a process group. Every
+            participating rank must call the same operation with compatible
+            tensor shapes, datatypes, and ordering. In NCCL, the rank is a
+            logical participant in an `ncclComm_t`, not necessarily the same
+            thing as a CUDA device ordinal.
+          </p>
+        </div>
+
+        <div class="collective-table" role="table" aria-label="Collective operation comparison">
+          <div class="table-row table-head" role="row">
+            <div role="columnheader">Primitive</div>
+            <div role="columnheader">Input per rank</div>
+            <div role="columnheader">Output per rank</div>
+            <div role="columnheader">Where it appears</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>Broadcast</strong></div>
+            <div role="cell">Root has N elements</div>
+            <div role="cell">Every rank gets root's N elements</div>
+            <div role="cell">Model initialization, parameter sync, checkpoint metadata</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>Reduce</strong></div>
+            <div role="cell">Every rank has N elements</div>
+            <div role="cell">Root gets reduced N elements</div>
+            <div role="cell">Metrics, loss aggregation, root-only summaries</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>AllReduce</strong></div>
+            <div role="cell">Every rank has N elements</div>
+            <div role="cell">Every rank gets the same reduced N elements</div>
+            <div role="cell">DDP gradient synchronization, tensor-parallel partial sums</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>AllGather</strong></div>
+            <div role="cell">Every rank has N elements</div>
+            <div role="cell">Every rank gets K chunks, total K*N</div>
+            <div role="cell">FSDP parameter materialization, sequence/tensor parallel gathers</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>ReduceScatter</strong></div>
+            <div role="cell">Every rank has K chunks</div>
+            <div role="cell">Rank i gets reduced chunk i</div>
+            <div role="cell">FSDP/ZeRO gradient sharding, optimizer-state partitioning</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>AllToAll</strong></div>
+            <div role="cell">Each rank has one chunk for every destination</div>
+            <div role="cell">Each rank receives one chunk from every source</div>
+            <div role="cell">MoE expert routing, sequence parallel transposes, shuffles</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>Gather / Scatter</strong></div>
+            <div role="cell">Many-to-one or one-to-many chunks</div>
+            <div role="cell">Root-only or per-rank partitioned output</div>
+            <div role="cell">Evaluation collection, root-driven setup, custom protocols</div>
+          </div>
+          <div class="table-row" role="row">
+            <div role="cell"><strong>Barrier</strong></div>
+            <div role="cell">No tensor payload required</div>
+            <div role="cell">All ranks continue after all arrive</div>
+            <div role="cell">Phase boundaries, debugging, startup coordination</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-pad split-section">
+        <div>
+          <p class="eyebrow">Equivalences</p>
+          <h2>Why all-reduce is often two collectives in disguise</h2>
+          <p>
+            A full all-reduce can be implemented as `ReduceScatter + AllGather`.
+            The reduce-scatter phase makes each rank responsible for one reduced
+            shard. The all-gather phase then shares those reduced shards until
+            everyone has the complete reduced tensor.
+          </p>
+          <p>
+            This decomposition is why sharded training likes reduce-scatter:
+            FSDP and ZeRO often do not need the full reduced gradient on every
+            rank. They can keep only the shard needed by that rank's optimizer
+            state and avoid materializing the full tensor.
+          </p>
+        </div>
+        <div class="formula-board" aria-label="Collective equivalence formulas">
+          <div>
+            <span>AllReduce</span>
+            <strong>ReduceScatter + AllGather</strong>
+          </div>
+          <div>
+            <span>Broadcast</span>
+            <strong>Scatter + AllGather</strong>
+          </div>
+          <div>
+            <span>AllGather backward</span>
+            <strong>ReduceScatter</strong>
+          </div>
+          <div>
+            <span>ReduceScatter backward</span>
+            <strong>AllGather</strong>
+          </div>
+        </div>
+      </section>
+
+      <section id="algorithms" class="section-pad section-band">
+        <div class="section-intro wide">
+          <p class="eyebrow">Algorithm families</p>
+          <h2>How libraries move bytes</h2>
+          <p>
+            NCCL chooses algorithms and protocols using message size,
+            topology, transport capabilities, and runtime tuning. The exact
+            choice is version- and system-dependent, but these families explain
+            the behavior most practitioners see in traces.
+          </p>
+        </div>
+
+        <div class="algorithm-grid">
+          <article class="algorithm-card">
+            <div class="card-kicker">Bandwidth first</div>
+            <h3>Ring</h3>
+            <p>
+              Ranks form one or more logical rings. Each rank sends to its next
+              neighbor and receives from its previous neighbor. Large tensors
+              are chunked so every link can stay busy.
+            </p>
+            <ul>
+              <li>Great for large messages because each rank injects and drains continuously.</li>
+              <li>All-reduce usually appears as reduce-scatter then all-gather.</li>
+              <li>Latency grows with rank count because data advances hop by hop.</li>
+            </ul>
+          </article>
+          <article class="algorithm-card">
+            <div class="card-kicker">Latency first</div>
+            <h3>Tree</h3>
+            <p>
+              Ranks are arranged as reduction and broadcast trees. Data reaches
+              the root in logarithmic depth, then fans back out. Double-tree
+              designs can use complementary trees to increase utilization.
+            </p>
+            <ul>
+              <li>Useful for smaller payloads or high-latency inter-node paths.</li>
+              <li>Handles root-oriented collectives naturally.</li>
+              <li>Can underuse bandwidth if only a few links are active at a time.</li>
+            </ul>
+          </article>
+          <article class="algorithm-card">
+            <div class="card-kicker">Topology aware</div>
+            <h3>Hierarchical</h3>
+            <p>
+              Work is split into intra-node and inter-node phases: reduce within
+              a node over NVLink/PCIe, communicate between node leaders over
+              InfiniBand or Ethernet, then distribute inside each node.
+            </p>
+            <ul>
+              <li>Reduces pressure on slow network links.</li>
+              <li>Depends heavily on rank placement and NIC affinity.</li>
+              <li>Common in multi-node GPU clusters.</li>
+            </ul>
+          </article>
+          <article class="algorithm-card">
+            <div class="card-kicker">Specialized fabrics</div>
+            <h3>Switch or network assisted</h3>
+            <p>
+              On capable systems, switches or network devices may accelerate
+              multicast, reduction, or collective network paths. NCCL exposes
+              tuning around CollNet, NVLink SHARP, NIC rails, and transport
+              selection.
+            </p>
+            <ul>
+              <li>Can cut GPU or host traffic when hardware supports it.</li>
+              <li>Misconfiguration often looks like slow initialization or unexpected fallback.</li>
+              <li>Debug logs are essential for seeing what NCCL selected.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section id="nccl" class="section-pad">
+        <div class="section-intro wide">
+          <p class="eyebrow">NCCL execution model</p>
+          <h2>What happens between your framework call and the interconnect</h2>
+        </div>
+
+        <div class="nccl-flow" aria-label="NCCL call lifecycle">
+          <div>
+            <span>1</span>
+            <strong>Process group</strong>
+            <p>Framework code maps workers to ranks and creates one or more communicators.</p>
+          </div>
+          <div>
+            <span>2</span>
+            <strong>Collective call</strong>
+            <p>Every rank launches the same operation with compatible tensor metadata.</p>
+          </div>
+          <div>
+            <span>3</span>
+            <strong>Plan selection</strong>
+            <p>NCCL considers topology, message size, channels, transports, and protocol thresholds.</p>
+          </div>
+          <div>
+            <span>4</span>
+            <strong>CUDA stream enqueue</strong>
+            <p>Communication kernels and network operations are ordered with stream semantics.</p>
+          </div>
+          <div>
+            <span>5</span>
+            <strong>GPU/NIC movement</strong>
+            <p>Chunks move across NVLink, PCIe, shared memory, sockets, or RDMA-capable network paths.</p>
+          </div>
+          <div>
+            <span>6</span>
+            <strong>Completion</strong>
+            <p>Work completes when the stream reaches the collective and all ranks satisfy the protocol.</p>
+          </div>
+        </div>
+
+        <div class="topology-area">
+          <div>
+            <h3>Topology shapes the ring</h3>
+            <p>
+              NCCL is topology-aware. It tries to build rings, trees, and
+              channels that follow the fast links first: NVLink/NVSwitch inside
+              a server, PCIe paths where necessary, and NIC rails for inter-node
+              movement. On multi-node jobs, the same rank order can perform very
+              differently depending on which process lands on which GPU and NIC.
+            </p>
+            <div class="callout-list">
+              <div>
+                <strong>Rank</strong>
+                <span>Logical participant in a communicator.</span>
+              </div>
+              <div>
+                <strong>Channel</strong>
+                <span>Parallel slice of a collective, often mapped to separate paths.</span>
+              </div>
+              <div>
+                <strong>Protocol</strong>
+                <span>Low-latency or high-throughput transfer method selected for size and transport.</span>
+              </div>
+              <div>
+                <strong>Transport</strong>
+                <span>Shared memory, CUDA IPC, NVLink, PCIe, socket, or RDMA path.</span>
+              </div>
+            </div>
+          </div>
+          <svg id="topology-svg" viewBox="0 0 900 520" role="img" aria-labelledby="topo-title topo-desc">
+            <title id="topo-title">Two-node GPU topology</title>
+            <desc id="topo-desc">
+              Two training nodes with GPUs connected locally and across NICs.
+            </desc>
+          </svg>
+        </div>
+      </section>
+
+      <section id="training" class="section-pad section-band">
+        <div class="section-intro wide">
+          <p class="eyebrow">Training systems</p>
+          <h2>Where collectives sit in modern distributed training</h2>
+          <p>
+            Different parallelism strategies choose different collectives
+            because they choose different tensor ownership. The fastest training
+            job is usually the one that reduces full replication, overlaps
+            communication with compute, and avoids forcing every rank to wait
+            for unrelated data.
+          </p>
+        </div>
+
+        <div class="training-layout">
+          <div class="training-timeline">
+            <div class="timeline-row">
+              <span>Forward</span>
+              <div class="bar compute" style="--start: 0; --width: 30">activations</div>
+            </div>
+            <div class="timeline-row">
+              <span>Backward</span>
+              <div class="bar compute" style="--start: 28; --width: 42">gradients</div>
+            </div>
+            <div class="timeline-row">
+              <span>DDP buckets</span>
+              <div class="bar comm" style="--start: 44; --width: 14">all-reduce</div>
+              <div class="bar comm" style="--start: 57; --width: 15">all-reduce</div>
+              <div class="bar comm" style="--start: 70; --width: 16">all-reduce</div>
+            </div>
+            <div class="timeline-row">
+              <span>Optimizer</span>
+              <div class="bar optimizer" style="--start: 86; --width: 12">step</div>
+            </div>
+          </div>
+
+          <div class="pattern-list">
+            <article>
+              <h3>Data parallel / DDP</h3>
+              <p>
+                Each rank owns a full model replica and a different microbatch.
+                Backward produces local gradients, then DDP all-reduces gradient
+                buckets so every replica applies the same optimizer update.
+              </p>
+            </article>
+            <article>
+              <h3>FSDP and ZeRO</h3>
+              <p>
+                Parameters, gradients, and optimizer state are sharded. Forward
+                commonly all-gathers parameter shards; backward uses
+                reduce-scatter so each rank keeps only the reduced shard it owns.
+              </p>
+            </article>
+            <article>
+              <h3>Tensor parallel</h3>
+              <p>
+                Layers are split across ranks. Column- and row-parallel linear
+                layers use all-gather, reduce-scatter, or all-reduce depending
+                on whether activations or partial sums are partitioned.
+              </p>
+            </article>
+            <article>
+              <h3>Pipeline parallel</h3>
+              <p>
+                Consecutive layer blocks live on different ranks. The dominant
+                communication is point-to-point activation and gradient transfer,
+                with collectives still used inside data/tensor-parallel groups.
+              </p>
+            </article>
+            <article>
+              <h3>Mixture of Experts</h3>
+              <p>
+                Tokens are routed to expert-owning ranks, often with all-to-all.
+                Imbalanced routing creates stragglers even when the collective
+                itself is efficient.
+              </p>
+            </article>
+            <article>
+              <h3>Evaluation and metrics</h3>
+              <p>
+                Scalar losses use reduce or all-reduce; predictions might use
+                gather or all-gather. These are usually small messages, so
+                launch latency matters more than peak bandwidth.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="performance" class="section-pad">
+        <div class="section-intro wide">
+          <p class="eyebrow">Performance model</p>
+          <h2>How to reason about scaling</h2>
+        </div>
+
+        <div class="performance-grid">
+          <article>
+            <h3>Latency and bandwidth</h3>
+            <p>
+              A simple model is `time ≈ α * steps + bytes / bandwidth`, where
+              `α` is per-step latency. Rings often minimize bytes per link for
+              large tensors, while trees often reduce step count for small
+              tensors.
+            </p>
+          </article>
+          <article>
+            <h3>Chunking and channels</h3>
+            <p>
+              Large tensors are split into chunks and sometimes channels. This
+              lets independent paths carry different pieces, but too many chunks
+              can add scheduling overhead.
+            </p>
+          </article>
+          <article>
+            <h3>Overlap</h3>
+            <p>
+              DDP launches all-reduce as soon as a gradient bucket is ready.
+              Good overlap hides communication behind remaining backward compute;
+              poor bucket order exposes communication on the critical path.
+            </p>
+          </article>
+          <article>
+            <h3>Rank mapping</h3>
+            <p>
+              Logical neighbors should align with physical neighbors. A ring
+              that jumps across sockets or NIC rails can waste bandwidth even
+              when the collective algorithm is theoretically optimal.
+            </p>
+          </article>
+          <article>
+            <h3>Precision and reduction semantics</h3>
+            <p>
+              Reductions are not bitwise associative in floating point. Changing
+              rank order, algorithm, bucket size, or datatype can change low
+              bits. Mixed-precision training must choose accumulation and
+              communication datatypes intentionally.
+            </p>
+          </article>
+          <article>
+            <h3>Stragglers</h3>
+            <p>
+              Collectives synchronize progress. A slow data loader, uneven MoE
+              routing, thermal throttling, or one congested NIC makes fast ranks
+              wait at the next collective.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section id="debugging" class="section-pad section-band">
+        <div class="section-intro wide">
+          <p class="eyebrow">Debugging playbook</p>
+          <h2>When collectives hang or underperform</h2>
+        </div>
+
+        <div class="debug-grid">
+          <div class="debug-card">
+            <h3>Correctness first</h3>
+            <ul>
+              <li>Every rank must enter the same collective in the same order.</li>
+              <li>Tensor counts and datatypes must match the collective contract.</li>
+              <li>Root arguments are ranks, not CUDA device IDs.</li>
+              <li>Async work must be waited on before consuming results.</li>
+            </ul>
+          </div>
+          <div class="debug-card">
+            <h3>NCCL visibility</h3>
+            <ul>
+              <li>Use `NCCL_DEBUG=INFO` for algorithm, transport, and topology clues.</li>
+              <li>Add `NCCL_DEBUG_SUBSYS=INIT,GRAPH,COLL,NET` when narrowing startup or network issues.</li>
+              <li>Check whether NCCL selected sockets, IB/RDMA, NVLink, or unexpected fallback paths.</li>
+              <li>Inspect rank-to-GPU and rank-to-NIC placement before tuning thresholds.</li>
+            </ul>
+          </div>
+          <div class="debug-card">
+            <h3>Performance checks</h3>
+            <ul>
+              <li>Compare single-node and multi-node bandwidth separately.</li>
+              <li>Run `all_reduce_perf` from nccl-tests for raw collective bandwidth.</li>
+              <li>Profile whether communication is overlapped or on the critical path.</li>
+              <li>Watch for host-side launch gaps, CPU affinity issues, or data-loader stalls.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="code-section">
+          <figure>
+            <figcaption>Minimal NCCL all-reduce shape</figcaption>
+            <pre><code>ncclComm_t comm;
+ncclCommInitRank(&amp;comm, nranks, id, rank);
+
+ncclAllReduce(sendbuf, recvbuf, count,
+              ncclFloat32, ncclSum,
+              comm, cuda_stream);
+
+cudaStreamSynchronize(cuda_stream);</code></pre>
+          </figure>
+          <figure>
+            <figcaption>PyTorch process-group shape</figcaption>
+            <pre><code>import torch
+import torch.distributed as dist
+
+dist.init_process_group("nccl")
+torch.cuda.set_device(local_rank)
+
+grad = torch.ones(1024, device="cuda")
+dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+grad /= dist.get_world_size()</code></pre>
+          </figure>
+        </div>
+      </section>
+
+      <section id="references" class="section-pad">
+        <div class="section-intro wide">
+          <p class="eyebrow">Sources</p>
+          <h2>Primary references</h2>
+          <p>
+            The diagrams are explanatory models built from public documentation
+            and common training-system practice. Exact NCCL algorithm choices
+            vary by version, GPU, interconnect, message size, environment, and
+            runtime topology.
+          </p>
+        </div>
+        <div class="reference-list">
+          <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html">
+            NVIDIA NCCL User Guide: Collective Operations
+          </a>
+          <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/colls.html">
+            NVIDIA NCCL API: Collective Communication Functions
+          </a>
+          <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html">
+            NVIDIA NCCL User Guide: Group Calls
+          </a>
+          <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/p2p.html">
+            NVIDIA NCCL User Guide: Point-to-point Communication
+          </a>
+          <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html">
+            NVIDIA NCCL User Guide: Environment Variables
+          </a>
+          <a href="https://docs.pytorch.org/docs/stable/distributed.html">
+            PyTorch Distributed Communication Package
+          </a>
+          <a href="https://docs.pytorch.org/docs/stable/notes/ddp.html">
+            PyTorch DistributedDataParallel Notes
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>NCCL Collectives Visual Guide</span>
+      <a href="#top">Back to top</a>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
