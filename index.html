@@ -73,8 +73,9 @@
           <p>
             Choose a collective, rank count, and algorithm. The diagram shows
             which ranks exchange chunks at each phase and how buffer ownership
-            changes. The math panel gives the communication shape used for
-            capacity planning.
+            changes. Animated packets show the active movement for the current
+            step, and hover labels explain ranks, chunks, and links without
+            forcing more text into the drawing.
           </p>
         </div>
 
@@ -112,7 +113,7 @@
               </div>
               <div class="step-counter" id="step-counter">0 / 0</div>
             </div>
-            <svg id="collective-svg" viewBox="0 0 900 620" role="img" aria-labelledby="sim-title sim-desc">
+            <svg id="collective-svg" viewBox="0 0 1000 720" role="img" aria-labelledby="sim-title sim-desc">
               <title id="sim-title">Collective simulator diagram</title>
               <desc id="sim-desc">
                 GPU ranks arranged in a ring, with arrows showing active
@@ -122,6 +123,9 @@
             <div class="timeline" id="timeline" aria-label="Step timeline"></div>
           </div>
           <aside class="sim-aside">
+            <div class="interaction-hint">
+              Hover ranks, packets, chunks, and group outlines for precise labels.
+            </div>
             <div>
               <p class="eyebrow">What is happening</p>
               <p id="step-detail" class="detail-text"></p>
@@ -135,7 +139,34 @@
               <p class="eyebrow">Common training use</p>
               <p id="training-use" class="detail-text"></p>
             </div>
+            <div>
+              <p class="eyebrow">What to watch</p>
+              <p id="collective-watch" class="detail-text"></p>
+            </div>
           </aside>
+        </div>
+
+        <div class="visual-key" aria-label="How to read the collective simulator">
+          <div data-tip="The logical rank inside the communicator. It may not match the CUDA device ordinal.">
+            <span class="key-dot rank-dot" aria-hidden="true"></span>
+            <strong>Rank node</strong>
+            <p>One communicator participant. Hover a node to see its current buffer ownership.</p>
+          </div>
+          <div data-tip="Colored mini-bars are tensor chunks. The label index is the logical chunk or shard owner.">
+            <span class="key-dot chunk-dot" aria-hidden="true"></span>
+            <strong>Chunk bar</strong>
+            <p>Current tensor pieces resident on that rank after this phase.</p>
+          </div>
+          <div data-tip="Green means distribution/gather-style movement. Red means reduction into partial sums.">
+            <span class="key-dot flow-dot" aria-hidden="true"></span>
+            <strong>Active flow</strong>
+            <p>Animated packets travel along the edge that is active in this step.</p>
+          </div>
+          <div data-tip="The cards on the right describe cost shape, not a hard performance guarantee.">
+            <span class="key-dot metric-dot" aria-hidden="true"></span>
+            <strong>Cost shape</strong>
+            <p>Rules of thumb for bytes, phases, and the usual scaling bottleneck.</p>
+          </div>
         </div>
       </section>
 
@@ -406,7 +437,9 @@
             Real large-model training usually uses a Cartesian product of
             process groups: data parallel groups replicate training examples,
             tensor parallel groups split layer math, pipeline groups split
-            depth, and expert groups split sparse MoE capacity.
+            depth, and expert groups split sparse MoE capacity. The drawing is
+            a simplified process-group map: it shows ownership and traffic, not
+            exact kernels or hardware routes.
           </p>
         </div>
 
@@ -422,7 +455,7 @@
                 <strong>DP x TP x PP x CP x EP</strong>
               </div>
             </div>
-            <svg id="parallelism-svg" viewBox="0 0 900 580" role="img" aria-labelledby="parallel-title parallel-desc">
+            <svg id="parallelism-svg" viewBox="0 0 1040 720" role="img" aria-labelledby="parallel-title parallel-desc">
               <title id="parallel-title">Parallelism strategy diagram</title>
               <desc id="parallel-desc">
                 A sixteen GPU grid showing how different parallelism strategies
@@ -445,7 +478,43 @@
               <p class="eyebrow">When it is useful</p>
               <p id="parallelism-fit" class="detail-text"></p>
             </div>
+            <div>
+              <p class="eyebrow">Common pitfall</p>
+              <p id="parallelism-pitfall" class="detail-text"></p>
+            </div>
           </aside>
+        </div>
+
+        <div class="explain-grid">
+          <article>
+            <span class="explain-number">1</span>
+            <h3>First choose the replicated unit</h3>
+            <p>
+              Data parallelism replicates the whole training computation and
+              shards only the data. Expert data parallelism replicates an
+              expert-parallel submesh. Pipeline and tensor parallelism usually
+              live inside each data-parallel replica.
+            </p>
+          </article>
+          <article>
+            <span class="explain-number">2</span>
+            <h3>Then choose what is split</h3>
+            <p>
+              Tensor parallelism splits a layer's math. Pipeline parallelism
+              splits layer depth. Expert parallelism splits sparse expert
+              capacity. FSDP/ZeRO splits model state while preserving
+              data-parallel training semantics.
+            </p>
+          </article>
+          <article>
+            <span class="explain-number">3</span>
+            <h3>Finally place each group on hardware</h3>
+            <p>
+              Put high-frequency TP collectives on fast intra-node links, avoid
+              making PP stage boundaries cross weak links unnecessarily, and
+              keep expert all-to-all groups where network bisection is strong.
+            </p>
+          </article>
         </div>
 
         <div class="parallelism-map">

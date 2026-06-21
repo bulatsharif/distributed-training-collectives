@@ -142,6 +142,27 @@ const collectiveDefinitions = {
   },
 };
 
+const collectiveWatch = {
+  allreduce:
+    "For large tensors, ring all-reduce is bandwidth-oriented but exposes every slow rank. Bucket ordering decides whether communication is hidden behind remaining backward compute or appears on the critical path.",
+  reducescatter:
+    "The final result is intentionally incomplete on each rank. That is a feature for sharded optimizers, but a bug if later code expects the full gradient tensor locally.",
+  allgather:
+    "All-gather increases resident memory because every rank materializes every shard. FSDP systems schedule and free gathered parameters carefully to avoid spikes.",
+  broadcast:
+    "The root is a logical communicator rank. If ranks disagree on the root or call order, the operation can hang even when tensor shapes look valid.",
+  reduce:
+    "Only the root receives the reduced result. Use all-reduce when every rank needs the value for control flow, logging, or an optimizer decision.",
+  alltoall:
+    "The average byte count is not enough. One overloaded destination expert or one much larger token block can make all other ranks wait.",
+  gather:
+    "Gather concentrates memory and receive work on the root. It is fine for small evaluation outputs but can become a root bottleneck for large tensors.",
+  scatter:
+    "Scatter assumes the root already owns correctly partitioned chunks. A shape or ordering mismatch silently sends the wrong shard to the wrong rank.",
+  barrier:
+    "A barrier tells you that ranks met at the same point; it does not fix the earlier mismatch that caused them to diverge.",
+};
+
 const algorithmOptions = [
   { value: "ring", label: "Ring / chunked" },
   { value: "tree", label: "Tree / fan-in-out" },
@@ -256,6 +277,23 @@ const parallelismDefinitions = {
   },
 };
 
+const parallelismPitfalls = {
+  data:
+    "DDP is easy to reason about, but it replicates optimizer state and gradients. Once the model no longer fits comfortably, increasing data parallel size alone will not solve memory pressure.",
+  fsdp:
+    "FSDP can trade memory for communication. If parameter all-gathers are not overlapped with compute, the job may fit but still scale poorly.",
+  tensor:
+    "Tensor parallelism is latency-sensitive because collectives happen inside layers. It usually belongs on the fastest local links, not across weak inter-node paths by default.",
+  pipeline:
+    "Pipeline parallelism can leave devices idle during fill and drain. Microbatch count, stage balance, and activation size decide whether the bubble is acceptable.",
+  expert:
+    "Expert parallelism depends on router balance. A theoretically sparse model can still stall if many tokens choose the same expert owner.",
+  expertData:
+    "EDP adds a second synchronization pattern: local expert routing plus matching-expert gradient sync across replicas. It needs process groups that reflect both axes.",
+  hybrid:
+    "Hybrid meshes are powerful but easy to mis-map. A bad rank order can place frequent TP collectives or expert all-to-all traffic on the slowest links.",
+};
+
 const state = {
   collective: "allreduce",
   algorithm: "ring",
@@ -281,6 +319,7 @@ const els = {
   metricGrid: document.querySelector("#metric-grid"),
   collectiveSummary: document.querySelector("#collective-summary"),
   trainingUse: document.querySelector("#training-use"),
+  collectiveWatch: document.querySelector("#collective-watch"),
   heroNetwork: document.querySelector("#hero-network"),
   topologySvg: document.querySelector("#topology-svg"),
   parallelismSelect: document.querySelector("#parallelism-select"),
@@ -289,6 +328,7 @@ const els = {
   parallelismSummary: document.querySelector("#parallelism-summary"),
   parallelismCommunication: document.querySelector("#parallelism-communication"),
   parallelismFit: document.querySelector("#parallelism-fit"),
+  parallelismPitfall: document.querySelector("#parallelism-pitfall"),
   parallelismMetrics: document.querySelector("#parallelism-metrics"),
 };
 
@@ -300,6 +340,12 @@ function createSvgElement(tag, attrs = {}, text = null) {
   if (text !== null) {
     node.textContent = text;
   }
+  return node;
+}
+
+function addSvgTitle(node, text) {
+  if (!text) return node;
+  node.appendChild(createSvgElement("title", {}, text));
   return node;
 }
 
@@ -316,7 +362,7 @@ function polarPoint(cx, cy, radius, index, total, offset = -Math.PI / 2) {
   };
 }
 
-function rankPositions(n, cx = 450, cy = 300, radius = 205) {
+function rankPositions(n, cx = 500, cy = 335, radius = 252) {
   return Array.from({ length: n }, (_, i) => polarPoint(cx, cy, radius, i, n));
 }
 
@@ -731,80 +777,131 @@ function renderEdge(svg, positions, edge, index, totalEdges) {
   const len = Math.hypot(dx, dy) || 1;
   const ux = dx / len;
   const uy = dy / len;
-  const offset = (index % 3) * 4 - 4;
+  const offset = totalEdges > 18 ? ((index % 5) - 2) * 5 : ((index % 3) - 1) * 8;
   const ox = -uy * offset;
   const oy = ux * offset;
-  const startX = from.x + ux * 45 + ox;
-  const startY = from.y + uy * 45 + oy;
-  const endX = to.x - ux * 45 + ox;
-  const endY = to.y - uy * 45 + oy;
-  const curve = totalEdges > 12 ? 16 : 24;
+  const startX = from.x + ux * 54 + ox;
+  const startY = from.y + uy * 54 + oy;
+  const endX = to.x - ux * 54 + ox;
+  const endY = to.y - uy * 54 + oy;
+  const curve = totalEdges > 18 ? 24 : 34;
   const mx = (startX + endX) / 2 - uy * curve;
   const my = (startY + endY) / 2 + ux * curve;
   const path = `M ${startX} ${startY} Q ${mx} ${my} ${endX} ${endY}`;
-  svg.appendChild(
+  const phase = edge.phase === "reduce" ? "reduction" : edge.phase === "gather" ? "distribution" : "transfer";
+  const packetStride = Math.max(1, Math.ceil(totalEdges / 12));
+  const showPacket = totalEdges <= 16 || index % packetStride === 0;
+  const flowGroup = addSvgTitle(
+    createSvgElement("g", { class: "flow-group" }),
+    `${edge.label}: active ${phase} edge for this phase.`,
+  );
+  flowGroup.appendChild(
     createSvgElement("path", {
       d: path,
       class: `edge active ${edge.phase || ""}`,
-      markerEnd: "url(#arrowhead)",
+      markerEnd: edge.phase === "reduce" ? "url(#arrowhead-reduce)" : edge.phase === "gather" ? "url(#arrowhead-gather)" : "url(#arrowhead)",
     }),
   );
-  const packet = createSvgElement("circle", {
-    cx: (startX + endX) / 2,
-    cy: (startY + endY) / 2,
-    r: 8,
-    fill: chunkColors[(edge.from + edge.to) % chunkColors.length],
-    class: "packet",
-  });
-  svg.appendChild(packet);
+  if (showPacket) {
+    const packet = createSvgElement("circle", {
+      cx: (startX + endX) / 2,
+      cy: (startY + endY) / 2,
+      r: totalEdges > 18 ? 5.5 : 7.5,
+      fill: chunkColors[(edge.from + edge.to) % chunkColors.length],
+      class: "flow-packet",
+    });
+    flowGroup.appendChild(packet);
+  }
+  if (totalEdges <= 10) {
+    const labelText = edge.phase === "reduce" ? "reduce" : edge.phase === "gather" ? "copy" : "send";
+    const chipWidth = labelText.length * 7 + 20;
+    const chipX = mx - chipWidth / 2;
+    const chipY = my - 14;
+    flowGroup.appendChild(
+      createSvgElement("rect", {
+        x: chipX,
+        y: chipY,
+        width: chipWidth,
+        height: 20,
+        rx: 10,
+        class: "phase-chip-bg",
+      }),
+    );
+    flowGroup.appendChild(
+      createSvgElement("text", {
+        x: mx,
+        y: my + 1,
+        "text-anchor": "middle",
+        class: "phase-chip",
+      }, labelText),
+    );
+  }
+  svg.appendChild(flowGroup);
 }
 
 function renderRank(svg, position, rank, chunks, totalRanks) {
-  const g = createSvgElement("g", { class: "rank-node" });
-  g.appendChild(createSvgElement("circle", { cx: position.x, cy: position.y, r: 37 }));
-  g.appendChild(createSvgElement("text", { x: position.x, y: position.y - 5 }, `r${rank}`));
+  const chunkList = chunks.length ? chunks.map((chunk) => `chunk ${chunk}`).join(", ") : "empty buffer";
+  const g = addSvgTitle(
+    createSvgElement("g", { class: "rank-node" }),
+    `Rank ${rank}: currently holds ${chunkList}.`,
+  );
+  g.appendChild(createSvgElement("circle", { cx: position.x, cy: position.y, r: 42 }));
+  g.appendChild(createSvgElement("text", { x: position.x, y: position.y - 7 }, `r${rank}`));
   g.appendChild(
     createSvgElement("text", { x: position.x, y: position.y + 18, class: "svg-small" }, `GPU ${rank}`),
   );
 
   const max = Math.max(totalRanks, 1);
-  const barWidth = 68;
-  const chunkWidth = Math.max(6, (barWidth - (max - 1) * 3) / max);
-  const y = position.y + 50;
+  const barWidth = 84;
+  const chunkWidth = Math.max(6, (barWidth - (max - 1) * 4) / max);
+  const y = position.y + 58;
   const x = position.x - barWidth / 2;
   chunks.forEach((chunk) => {
-    g.appendChild(
-      createSvgElement("rect", {
-        x: x + chunk * (chunkWidth + 3),
-        y,
-        width: chunkWidth,
-        height: 12,
-        rx: 3,
-        fill: chunkColors[chunk % chunkColors.length],
-        class: "chunk",
-      }),
-    );
+    const rect = createSvgElement("rect", {
+      x: x + chunk * (chunkWidth + 4),
+      y,
+      width: chunkWidth,
+      height: 13,
+      rx: 3,
+      fill: chunkColors[chunk % chunkColors.length],
+      class: "chunk",
+    });
+    addSvgTitle(rect, `Rank ${rank} buffer contains logical chunk ${chunk}.`);
+    g.appendChild(rect);
   });
   g.appendChild(
     createSvgElement("rect", {
       x,
       y,
       width: barWidth,
-      height: 12,
+      height: 13,
       rx: 3,
       fill: "none",
       stroke: "#b8c4c1",
       "stroke-width": 1,
     }),
   );
+  if (chunks.length > 0) {
+    g.appendChild(
+      createSvgElement("rect", {
+        x: position.x - 29,
+        y: y + 19,
+        width: 58,
+        height: 18,
+        rx: 9,
+        class: "phase-chip-bg",
+      }),
+    );
+    g.appendChild(createSvgElement("text", { x: position.x, y: y + 32, class: "buffer-label", "text-anchor": "middle" }, "buffer"));
+  }
   svg.appendChild(g);
 }
 
 function renderLegend(svg, n) {
-  const g = createSvgElement("g", { transform: "translate(28 552)" });
+  const g = createSvgElement("g", { transform: "translate(38 40)" });
   g.appendChild(createSvgElement("text", { x: 0, y: 0, class: "svg-label" }, "Chunk labels"));
   for (let i = 0; i < n; i++) {
-    const x = i * 74;
+    const x = i * 88;
     g.appendChild(
       createSvgElement("rect", {
         x,
@@ -818,6 +915,7 @@ function renderLegend(svg, n) {
     );
     g.appendChild(createSvgElement("text", { x: x + 26, y: 30, class: "svg-small" }, `chunk ${i}`));
   }
+  g.appendChild(createSvgElement("text", { x: 0, y: 55, class: "svg-small" }, "Hover a rank or moving packet for exact ownership and flow details."));
   svg.appendChild(g);
 }
 
@@ -830,17 +928,23 @@ function renderSimulator() {
 
   clear(els.svg);
   const defs = createSvgElement("defs");
-  const marker = createSvgElement("marker", {
-    id: "arrowhead",
-    viewBox: "0 0 10 10",
-    refX: "9",
-    refY: "5",
-    markerWidth: "7",
-    markerHeight: "7",
-    orient: "auto-start-reverse",
+  [
+    ["arrowhead", "#16817a"],
+    ["arrowhead-reduce", "#c4544f"],
+    ["arrowhead-gather", "#5b8c3a"],
+  ].forEach(([id, fill]) => {
+    const marker = createSvgElement("marker", {
+      id,
+      viewBox: "0 0 10 10",
+      refX: "9",
+      refY: "5",
+      markerWidth: "7",
+      markerHeight: "7",
+      orient: "auto-start-reverse",
+    });
+    marker.appendChild(createSvgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill }));
+    defs.appendChild(marker);
   });
-  marker.appendChild(createSvgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "currentColor" }));
-  defs.appendChild(marker);
   els.svg.appendChild(defs);
 
   const baseRing = ringEdges(state.ranks);
@@ -867,8 +971,9 @@ function renderSimulator() {
   els.stepCounter.textContent = `${state.step + 1} / ${steps.length}`;
   els.collectiveSummary.textContent = `${def.summary} API shape: ${def.apis}.`;
   els.trainingUse.textContent = def.training;
+  els.collectiveWatch.textContent = collectiveWatch[state.collective];
   renderMetrics(def.metrics(state.ranks));
-  renderTimeline(steps.length);
+  renderTimeline(steps);
 }
 
 function renderMetrics(metrics) {
@@ -885,13 +990,14 @@ function renderMetrics(metrics) {
   });
 }
 
-function renderTimeline(count) {
+function renderTimeline(steps) {
   clear(els.timeline);
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < steps.length; i++) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = i === state.step ? "active" : "";
     button.setAttribute("aria-label", `Go to step ${i + 1}`);
+    button.title = steps[i].title;
     button.addEventListener("click", () => {
       state.step = i;
       stopPlayback();
@@ -982,7 +1088,7 @@ function initControls() {
       return;
     }
     els.playSteps.textContent = "Pause";
-    state.timer = setInterval(nextStep, 1150);
+    state.timer = setInterval(nextStep, 1850);
   });
 }
 
@@ -1089,12 +1195,12 @@ function renderTopology() {
 }
 
 function parallelTiles() {
-  const tileWidth = 142;
-  const tileHeight = 62;
-  const startX = 70;
-  const startY = 98;
-  const gapX = 190;
-  const gapY = 92;
+  const tileWidth = 158;
+  const tileHeight = 74;
+  const startX = 82;
+  const startY = 142;
+  const gapX = 238;
+  const gapY = 118;
   return Array.from({ length: 16 }, (_, rank) => {
     const col = rank % 4;
     const row = Math.floor(rank / 4);
@@ -1136,7 +1242,8 @@ function drawParallelGroup(svg, tiles, ranks, label, color, pad = 10) {
   const minY = Math.min(...selected.map((tile) => tile.y)) - pad;
   const maxX = Math.max(...selected.map((tile) => tile.x + tile.width)) + pad;
   const maxY = Math.max(...selected.map((tile) => tile.y + tile.height)) + pad;
-  svg.appendChild(
+  const group = addSvgTitle(createSvgElement("g", { class: "parallel-group-wrap" }), label);
+  group.appendChild(
     createSvgElement("rect", {
       x: minX,
       y: minY,
@@ -1147,11 +1254,15 @@ function drawParallelGroup(svg, tiles, ranks, label, color, pad = 10) {
       stroke: color,
     }),
   );
-  svg.appendChild(createSvgElement("text", { x: minX + 10, y: minY - 7, class: "svg-small", fill: color }, label));
+  group.appendChild(createSvgElement("text", { x: minX + 10, y: minY - 9, class: "svg-small", fill: color }, label));
+  svg.appendChild(group);
 }
 
 function drawParallelTile(svg, tile, title, subtitle, color, fill = "#ffffff") {
-  const g = createSvgElement("g", { class: "parallel-tile" });
+  const g = addSvgTitle(
+    createSvgElement("g", { class: "parallel-tile" }),
+    `Rank ${tile.rank}: ${title}; ${subtitle}.`,
+  );
   g.appendChild(
     createSvgElement("rect", {
       x: tile.x,
@@ -1176,21 +1287,39 @@ function drawParallelTile(svg, tile, title, subtitle, color, fill = "#ffffff") {
   g.appendChild(
     createSvgElement("text", {
       x: tile.cx,
-      y: tile.y + 34,
+      y: tile.y + 39,
       "font-size": 13,
       "font-weight": 800,
     }, title),
   );
-  g.appendChild(createSvgElement("text", { x: tile.cx, y: tile.y + 51, class: "svg-small" }, subtitle));
+  g.appendChild(createSvgElement("text", { x: tile.cx, y: tile.y + 58, class: "svg-small" }, subtitle));
   svg.appendChild(g);
 }
 
-function drawParallelLine(svg, from, to, color = "#16817a", dashed = false, curve = 0) {
+function connectionPoint(from, to, outward = 1) {
+  const dx = to.cx - from.cx;
+  const dy = to.cy - from.cy;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len;
+  const uy = dy / len;
+  const padX = from.width ? from.width / 2 + 12 : 22;
+  const padY = from.height ? from.height / 2 + 12 : 22;
+  const pad = Math.min(Math.abs(dx) > Math.abs(dy) ? padX : padY, 58);
+  return {
+    cx: from.cx + ux * pad * outward,
+    cy: from.cy + uy * pad * outward,
+  };
+}
+
+function drawParallelLine(svg, from, to, color = "#16817a", dashed = false, curve = 0, label = "traffic") {
+  const start = connectionPoint(from, to, 1);
+  const end = connectionPoint(to, from, 1);
   const d =
     curve === 0
-      ? `M ${from.cx} ${from.cy} L ${to.cx} ${to.cy}`
-      : `M ${from.cx} ${from.cy} Q ${(from.cx + to.cx) / 2} ${(from.cy + to.cy) / 2 - curve} ${to.cx} ${to.cy}`;
-  svg.appendChild(
+      ? `M ${start.cx} ${start.cy} L ${end.cx} ${end.cy}`
+      : `M ${start.cx} ${start.cy} Q ${(start.cx + end.cx) / 2} ${(start.cy + end.cy) / 2 - curve} ${end.cx} ${end.cy}`;
+  const group = addSvgTitle(createSvgElement("g", { class: "parallel-flow-wrap" }), label);
+  group.appendChild(
     createSvgElement("path", {
       d,
       class: `parallel-flow ${dashed ? "faint" : ""}`,
@@ -1199,12 +1328,22 @@ function drawParallelLine(svg, from, to, color = "#16817a", dashed = false, curv
       "marker-end": "url(#parallel-arrow)",
     }),
   );
+  group.appendChild(
+    createSvgElement("circle", {
+      cx: (start.cx + end.cx) / 2,
+      cy: (start.cy + end.cy) / 2,
+      r: 5.5,
+      fill: color,
+      class: "flow-packet",
+    }),
+  );
+  svg.appendChild(group);
 }
 
 function drawParallelLegend(svg, items) {
-  const g = createSvgElement("g", { transform: "translate(70 510)" });
+  const g = createSvgElement("g", { transform: "translate(82 650)" });
   items.forEach((item, index) => {
-    const x = index * 168;
+    const x = index * 210;
     g.appendChild(createSvgElement("rect", { x, y: 0, width: 18, height: 18, rx: 4, fill: item.color }));
     g.appendChild(createSvgElement("text", { x: x + 26, y: 14, class: "svg-small" }, item.label));
   });
@@ -1213,7 +1352,15 @@ function drawParallelLegend(svg, items) {
 
 function drawRingOnRanks(svg, tiles, ranks, color) {
   ranks.forEach((rank, index) => {
-    drawParallelLine(svg, tiles[rank], tiles[ranks[(index + 1) % ranks.length]], color, true, index % 2 ? 18 : -18);
+    drawParallelLine(
+      svg,
+      tiles[rank],
+      tiles[ranks[(index + 1) % ranks.length]],
+      color,
+      true,
+      index % 2 ? 26 : -26,
+      `Rank ${rank} exchanges with rank ${ranks[(index + 1) % ranks.length]}.`,
+    );
   });
 }
 
@@ -1223,9 +1370,9 @@ function drawParallelismSvg(key) {
   clear(svg);
   addParallelArrowDefs(svg);
 
-  svg.appendChild(createSvgElement("text", { x: 70, y: 44, class: "svg-label" }, parallelismDefinitions[key].label));
+  svg.appendChild(createSvgElement("text", { x: 82, y: 54, class: "svg-label" }, parallelismDefinitions[key].label));
   svg.appendChild(
-    createSvgElement("text", { x: 70, y: 68, class: "svg-small" }, "Sixteen ranks shown as a process-group mesh; colored boxes are communication or ownership groups."),
+    createSvgElement("text", { x: 82, y: 82, class: "svg-small" }, "Sixteen ranks shown as a process-group mesh; colored boxes are communication or ownership groups."),
   );
 
   if (key === "data") {
@@ -1254,7 +1401,17 @@ function drawParallelismSvg(key) {
     for (let row = 0; row < 4; row++) {
       const ranks = [0, 1, 2, 3].map((col) => row * 4 + col);
       drawParallelGroup(svg, tiles, ranks, `TP group ${row}: split one layer`, chunkColors[row], 10);
-      ranks.slice(0, -1).forEach((rank) => drawParallelLine(svg, tiles[rank], tiles[rank + 1], chunkColors[row], true));
+      ranks.slice(0, -1).forEach((rank) =>
+        drawParallelLine(
+          svg,
+          tiles[rank],
+          tiles[rank + 1],
+          chunkColors[row],
+          true,
+          0,
+          `Tensor-parallel exchange inside TP group ${row}: partial sums or activation shards move between rank ${rank} and rank ${rank + 1}.`,
+        ),
+      );
     }
     tiles.forEach((tile) => drawParallelTile(svg, tile, `W slice ${tile.col}`, `layer group ${tile.row}`, chunkColors[tile.row], "#f8fbfa"));
     drawParallelLegend(svg, [
@@ -1272,7 +1429,15 @@ function drawParallelismSvg(key) {
     }
     for (let row = 0; row < 4; row++) {
       for (let col = 0; col < 3; col++) {
-        drawParallelLine(svg, tiles[row * 4 + col], tiles[row * 4 + col + 1], "#bf7c21", false);
+        drawParallelLine(
+          svg,
+          tiles[row * 4 + col],
+          tiles[row * 4 + col + 1],
+          "#bf7c21",
+          false,
+          0,
+          `Pipeline microbatch lane ${row}: activations move from stage ${col} to stage ${col + 1}.`,
+        );
       }
     }
     tiles.forEach((tile) => drawParallelTile(svg, tile, `layers ${tile.col}`, `microbatch lane ${tile.row}`, chunkColors[tile.col], "#fffaf3"));
@@ -1285,11 +1450,21 @@ function drawParallelismSvg(key) {
 
   if (key === "expert") {
     drawParallelGroup(svg, tiles, tiles.map((tile) => tile.rank), "EP group: experts distributed over ranks", "#c4544f", 16);
-    const router = { cx: 450, cy: 86 };
-    svg.appendChild(createSvgElement("rect", { x: 380, y: 60, width: 140, height: 40, rx: 8, fill: "#273033" }));
-    svg.appendChild(createSvgElement("text", { x: 450, y: 85, "text-anchor": "middle", fill: "#fff", "font-weight": 760 }, "router"));
+    const router = { cx: 520, cy: 102, width: 150, height: 46 };
+    const routerGroup = addSvgTitle(createSvgElement("g"), "Router scores tokens, chooses experts, then dispatches token blocks to expert owners.");
+    routerGroup.appendChild(createSvgElement("rect", { x: 445, y: 79, width: 150, height: 46, rx: 8, fill: "#273033" }));
+    routerGroup.appendChild(createSvgElement("text", { x: 520, y: 108, "text-anchor": "middle", fill: "#fff", "font-weight": 760 }, "router"));
+    svg.appendChild(routerGroup);
     [1, 3, 5, 8, 10, 12, 14].forEach((rank, index) => {
-      drawParallelLine(svg, router, tiles[rank], chunkColors[index], false, 28 + index * 2);
+      drawParallelLine(
+        svg,
+        router,
+        tiles[rank],
+        chunkColors[index],
+        false,
+        38 + index * 2,
+        `Token block ${index} is dispatched to expert owner rank ${rank}.`,
+      );
     });
     tiles.forEach((tile) => drawParallelTile(svg, tile, `expert ${tile.rank % 8}`, "token owner", "#c4544f", "#fff8f8"));
     drawParallelLegend(svg, [
@@ -1306,7 +1481,15 @@ function drawParallelismSvg(key) {
     drawParallelGroup(svg, tiles, top, "EP group A / data replica 0", "#c4544f", 13);
     drawParallelGroup(svg, tiles, bottom, "EP group B / data replica 1", "#2f7fa4", 13);
     for (let i = 0; i < 8; i++) {
-      drawParallelLine(svg, tiles[i], tiles[i + 8], "#5b8c3a", true);
+      drawParallelLine(
+        svg,
+        tiles[i],
+        tiles[i + 8],
+        "#5b8c3a",
+        true,
+        0,
+        `Matching expert ${i} synchronizes gradients across data replicas.`,
+      );
     }
     [...top, ...bottom].forEach((rank) => {
       const tile = tiles[rank];
@@ -1326,11 +1509,15 @@ function drawParallelismSvg(key) {
   drawParallelGroup(svg, tiles, topReplica, "DP replica 0: TP x PP x EP submesh", "#16817a", 15);
   drawParallelGroup(svg, tiles, bottomReplica, "DP replica 1: matching submesh", "#7758a6", 15);
   [0, 1, 2, 3].forEach((col) => {
-    drawParallelLine(svg, tiles[col], tiles[col + 4], "#bf7c21", false);
-    drawParallelLine(svg, tiles[col + 8], tiles[col + 12], "#bf7c21", false);
+    drawParallelLine(svg, tiles[col], tiles[col + 4], "#bf7c21", false, 0, `Pipeline activation path inside data replica 0, column ${col}.`);
+    drawParallelLine(svg, tiles[col + 8], tiles[col + 12], "#bf7c21", false, 0, `Pipeline activation path inside data replica 1, column ${col}.`);
   });
-  [0, 2, 8, 10].forEach((rank) => drawParallelLine(svg, tiles[rank], tiles[rank + 1], "#2f7fa4", true));
-  [4, 6, 12, 14].forEach((rank) => drawParallelLine(svg, tiles[rank], tiles[rank + 1], "#c4544f", true));
+  [0, 2, 8, 10].forEach((rank) =>
+    drawParallelLine(svg, tiles[rank], tiles[rank + 1], "#2f7fa4", true, 0, `Tensor-parallel collective between rank ${rank} and rank ${rank + 1}.`),
+  );
+  [4, 6, 12, 14].forEach((rank) =>
+    drawParallelLine(svg, tiles[rank], tiles[rank + 1], "#c4544f", true, 0, `Expert-parallel token path between rank ${rank} and rank ${rank + 1}.`),
+  );
   tiles.forEach((tile) => {
     const dp = tile.row < 2 ? 0 : 1;
     const pp = tile.row % 2;
@@ -1367,6 +1554,7 @@ function renderParallelism() {
   els.parallelismSummary.textContent = def.summary;
   els.parallelismCommunication.textContent = def.communication;
   els.parallelismFit.textContent = def.fit;
+  els.parallelismPitfall.textContent = parallelismPitfalls[state.parallelism];
   renderParallelismMetrics(def.metrics);
   drawParallelismSvg(state.parallelism);
 }
