@@ -1218,7 +1218,7 @@ function parallelTiles() {
   const startX = 82;
   const startY = 142;
   const gapX = 238;
-  const gapY = 118;
+  const gapY = 132;
   return Array.from({ length: 16 }, (_, rank) => {
     const col = rank % 4;
     const row = Math.floor(rank / 4);
@@ -1260,6 +1260,9 @@ function drawParallelGroup(svg, tiles, ranks, label, color, pad = 10) {
   const minY = Math.min(...selected.map((tile) => tile.y)) - pad;
   const maxX = Math.max(...selected.map((tile) => tile.x + tile.width)) + pad;
   const maxY = Math.max(...selected.map((tile) => tile.y + tile.height)) + pad;
+  const labelWidth = Math.min(maxX - minX - 24, Math.max(104, label.length * 6.7 + 24));
+  const labelX = minX + 12;
+  const labelY = minY - 12;
   const group = addSvgTitle(createSvgElement("g", { class: "parallel-group-wrap" }), label);
   group.appendChild(
     createSvgElement("rect", {
@@ -1272,7 +1275,17 @@ function drawParallelGroup(svg, tiles, ranks, label, color, pad = 10) {
       stroke: color,
     }),
   );
-  group.appendChild(createSvgElement("text", { x: minX + 10, y: minY - 9, class: "svg-small", fill: color }, label));
+  group.appendChild(
+    createSvgElement("rect", {
+      x: labelX - 8,
+      y: labelY - 15,
+      width: labelWidth,
+      height: 23,
+      rx: 8,
+      class: "parallel-group-label-bg",
+    }),
+  );
+  group.appendChild(createSvgElement("text", { x: labelX, y: labelY, class: "parallel-group-label", fill: color }, label));
   svg.appendChild(group);
 }
 

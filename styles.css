@@ -935,6 +935,17 @@ li + li {
   stroke-dasharray: 9 7;
 }
 
+.parallel-group-label-bg {
+  fill: rgba(255, 255, 255, 0.94);
+  stroke: rgba(215, 223, 220, 0.9);
+  stroke-width: 1;
+}
+
+.parallel-group-label {
+  font-size: 12px;
+  font-weight: 760;
+}
+
 .parallel-flow {
   fill: none;
   stroke-width: 4;
