@@ -898,14 +898,32 @@ function renderRank(svg, position, rank, chunks, totalRanks) {
 }
 
 function renderLegend(svg, n) {
-  const g = createSvgElement("g", { transform: "translate(38 40)" });
+  const g = addSvgTitle(
+    createSvgElement("g", { transform: "translate(18 42)", class: "chunk-legend" }),
+    "Legend for logical tensor chunks shown in each rank buffer.",
+  );
+  g.appendChild(
+    createSvgElement("rect", {
+      x: -16,
+      y: -28,
+      width: 210,
+      height: 174,
+      rx: 10,
+      fill: "#ffffff",
+      opacity: 0.92,
+      stroke: "#d7dfdc",
+    }),
+  );
   g.appendChild(createSvgElement("text", { x: 0, y: 0, class: "svg-label" }, "Chunk labels"));
   for (let i = 0; i < n; i++) {
-    const x = i * 88;
+    const col = Math.floor(i / 4);
+    const row = i % 4;
+    const x = col * 104;
+    const y = 24 + row * 26;
     g.appendChild(
       createSvgElement("rect", {
         x,
-        y: 18,
+        y,
         width: 20,
         height: 14,
         rx: 3,
@@ -913,9 +931,9 @@ function renderLegend(svg, n) {
         class: "chunk",
       }),
     );
-    g.appendChild(createSvgElement("text", { x: x + 26, y: 30, class: "svg-small" }, `chunk ${i}`));
+    g.appendChild(createSvgElement("text", { x: x + 28, y: y + 12, class: "svg-small" }, `chunk ${i}`));
   }
-  g.appendChild(createSvgElement("text", { x: 0, y: 55, class: "svg-small" }, "Hover a rank or moving packet for exact ownership and flow details."));
+  g.appendChild(createSvgElement("text", { x: 0, y: 136, class: "svg-small" }, "Hover ranks, chunks, and flows."));
   svg.appendChild(g);
 }
 
