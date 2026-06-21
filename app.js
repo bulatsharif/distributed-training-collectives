@@ -148,9 +148,118 @@ const algorithmOptions = [
   { value: "direct", label: "Direct peer view" },
 ];
 
+const parallelismDefinitions = {
+  data: {
+    label: "Data Parallel / DDP",
+    summary:
+      "The full model is replicated on every rank, while each rank consumes a different data shard. Training semantics stay simple: every replica should apply the same parameter update.",
+    communication:
+      "Backward produces local gradients, then the data-parallel group synchronizes them with all-reduce or an equivalent reduce-scatter plus all-gather path.",
+    fit:
+      "Best when the model fits per GPU and the main goal is throughput from larger global batch size.",
+    metrics: [
+      ["Model state", "replicated"],
+      ["Batch", "sharded by sample"],
+      ["Main traffic", "gradient all-reduce"],
+      ["Scaling limit", "batch size and gradient sync"],
+    ],
+  },
+  fsdp: {
+    label: "FSDP / ZeRO-style Sharded DP",
+    summary:
+      "The data-parallel axis remains, but model state is sharded across data-parallel ranks instead of fully replicated. Each rank materializes parameters only when needed.",
+    communication:
+      "Forward and backward all-gather parameter shards before compute; backward reduce-scatters gradients back into owned shards.",
+    fit:
+      "Best when the model is close to fitting but optimizer state, gradients, or parameters are the memory bottleneck.",
+    metrics: [
+      ["Model state", "parameters, gradients, optimizer sharded"],
+      ["Batch", "sharded by sample"],
+      ["Main traffic", "all-gather + reduce-scatter"],
+      ["Scaling limit", "parameter gather exposure"],
+    ],
+  },
+  tensor: {
+    label: "Tensor Parallel",
+    summary:
+      "A single layer's matrices and intermediate tensors are split across ranks. Ranks jointly compute one layer rather than owning independent replicas of the whole layer.",
+    communication:
+      "Column/row splits require all-reduce, all-gather, or reduce-scatter around linear layers, attention projections, and partial sums.",
+    fit:
+      "Best for layers that are too large or too slow on one GPU, especially within a high-bandwidth NVLink or NVSwitch domain.",
+    metrics: [
+      ["Model state", "layer tensors sharded"],
+      ["Batch", "usually shared inside TP group"],
+      ["Main traffic", "partial-sum collectives"],
+      ["Scaling limit", "intra-layer latency"],
+    ],
+  },
+  pipeline: {
+    label: "Pipeline Parallel",
+    summary:
+      "The model depth is split into consecutive stages. Microbatches flow through the stages so different GPUs work on different layers at the same time.",
+    communication:
+      "Adjacent stages send activations forward and activation gradients backward with point-to-point communication.",
+    fit:
+      "Best when total model depth does not fit on one rank, or when cross-node bandwidth makes full-graph collectives too expensive.",
+    metrics: [
+      ["Model state", "layers sharded by depth"],
+      ["Batch", "split into microbatches"],
+      ["Main traffic", "activation send/recv"],
+      ["Scaling limit", "pipeline bubble and imbalance"],
+    ],
+  },
+  expert: {
+    label: "Expert Parallel",
+    summary:
+      "MoE expert weights are split across ranks. Dense layers may remain replicated or separately parallelized, while only router-selected tokens visit each expert.",
+    communication:
+      "MoE layers dispatch tokens to expert owners and combine outputs, commonly with all-to-all traffic inside an expert-parallel group.",
+    fit:
+      "Best for sparse MoE models where total parameter count grows through many experts but each token activates only a subset.",
+    metrics: [
+      ["Model state", "experts sharded"],
+      ["Token path", "router -> expert owner"],
+      ["Main traffic", "all-to-all dispatch/combine"],
+      ["Scaling limit", "token balance and bisection"],
+    ],
+  },
+  expertData: {
+    label: "Expert Data Parallel",
+    summary:
+      "Expert-parallel groups are replicated across data-parallel replicas. Each replica routes its own tokens to local expert owners, while matching experts synchronize across replicas.",
+    communication:
+      "All-to-all token dispatch happens inside each expert-parallel group; expert gradients then synchronize across matching expert replicas.",
+    fit:
+      "Best when a MoE model needs both sparse expert capacity and higher data throughput from multiple expert-group replicas.",
+    metrics: [
+      ["Model state", "expert groups replicated"],
+      ["Experts", "sharded inside each EP group"],
+      ["Main traffic", "local all-to-all + expert grad sync"],
+      ["Scaling limit", "expert load balance"],
+    ],
+  },
+  hybrid: {
+    label: "Hybrid 3D + Expert Layout",
+    summary:
+      "Large training jobs combine axes. A rank can belong to a DP group, TP group, PP stage, and EP group at once; each axis has its own process group and communication pattern.",
+    communication:
+      "TP collectives happen inside layers, PP sends activations between stages, EP routes MoE tokens, and DP/FSDP synchronizes the state shared across replicas.",
+    fit:
+      "Best for frontier-scale dense or MoE models where no single axis provides enough memory capacity or throughput.",
+    metrics: [
+      ["Example mesh", "DP=2, TP=2, PP=2, EP=2"],
+      ["World size", "16 ranks in this diagram"],
+      ["Main traffic", "collectives + p2p + all-to-all"],
+      ["Scaling limit", "coordination and topology"],
+    ],
+  },
+};
+
 const state = {
   collective: "allreduce",
   algorithm: "ring",
+  parallelism: "hybrid",
   ranks: 6,
   step: 0,
   timer: null,
@@ -174,6 +283,13 @@ const els = {
   trainingUse: document.querySelector("#training-use"),
   heroNetwork: document.querySelector("#hero-network"),
   topologySvg: document.querySelector("#topology-svg"),
+  parallelismSelect: document.querySelector("#parallelism-select"),
+  parallelismSvg: document.querySelector("#parallelism-svg"),
+  parallelismTitle: document.querySelector("#parallelism-title"),
+  parallelismSummary: document.querySelector("#parallelism-summary"),
+  parallelismCommunication: document.querySelector("#parallelism-communication"),
+  parallelismFit: document.querySelector("#parallelism-fit"),
+  parallelismMetrics: document.querySelector("#parallelism-metrics"),
 };
 
 function createSvgElement(tag, attrs = {}, text = null) {
@@ -972,7 +1088,307 @@ function renderTopology() {
   svg.appendChild(createSvgElement("text", { x: 450, y: 428, "text-anchor": "middle", class: "svg-small" }, "NCCL maps logical ranks onto these physical paths, then slices collectives into rings, trees, and channels."));
 }
 
+function parallelTiles() {
+  const tileWidth = 142;
+  const tileHeight = 62;
+  const startX = 70;
+  const startY = 98;
+  const gapX = 190;
+  const gapY = 92;
+  return Array.from({ length: 16 }, (_, rank) => {
+    const col = rank % 4;
+    const row = Math.floor(rank / 4);
+    const x = startX + col * gapX;
+    const y = startY + row * gapY;
+    return {
+      rank,
+      col,
+      row,
+      x,
+      y,
+      width: tileWidth,
+      height: tileHeight,
+      cx: x + tileWidth / 2,
+      cy: y + tileHeight / 2,
+    };
+  });
+}
+
+function addParallelArrowDefs(svg) {
+  const defs = createSvgElement("defs");
+  const marker = createSvgElement("marker", {
+    id: "parallel-arrow",
+    viewBox: "0 0 10 10",
+    refX: "9",
+    refY: "5",
+    markerWidth: "7",
+    markerHeight: "7",
+    orient: "auto",
+  });
+  marker.appendChild(createSvgElement("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "#16817a" }));
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+}
+
+function drawParallelGroup(svg, tiles, ranks, label, color, pad = 10) {
+  const selected = ranks.map((rank) => tiles[rank]);
+  const minX = Math.min(...selected.map((tile) => tile.x)) - pad;
+  const minY = Math.min(...selected.map((tile) => tile.y)) - pad;
+  const maxX = Math.max(...selected.map((tile) => tile.x + tile.width)) + pad;
+  const maxY = Math.max(...selected.map((tile) => tile.y + tile.height)) + pad;
+  svg.appendChild(
+    createSvgElement("rect", {
+      x: minX,
+      y: minY,
+      width: maxX - minX,
+      height: maxY - minY,
+      rx: 12,
+      class: "parallel-group",
+      stroke: color,
+    }),
+  );
+  svg.appendChild(createSvgElement("text", { x: minX + 10, y: minY - 7, class: "svg-small", fill: color }, label));
+}
+
+function drawParallelTile(svg, tile, title, subtitle, color, fill = "#ffffff") {
+  const g = createSvgElement("g", { class: "parallel-tile" });
+  g.appendChild(
+    createSvgElement("rect", {
+      x: tile.x,
+      y: tile.y,
+      width: tile.width,
+      height: tile.height,
+      rx: 8,
+      fill,
+      stroke: color,
+    }),
+  );
+  g.appendChild(
+    createSvgElement("text", {
+      x: tile.x + 16,
+      y: tile.y + 19,
+      "text-anchor": "start",
+      "font-size": 12,
+      "font-weight": 800,
+      fill: color,
+    }, `r${tile.rank}`),
+  );
+  g.appendChild(
+    createSvgElement("text", {
+      x: tile.cx,
+      y: tile.y + 34,
+      "font-size": 13,
+      "font-weight": 800,
+    }, title),
+  );
+  g.appendChild(createSvgElement("text", { x: tile.cx, y: tile.y + 51, class: "svg-small" }, subtitle));
+  svg.appendChild(g);
+}
+
+function drawParallelLine(svg, from, to, color = "#16817a", dashed = false, curve = 0) {
+  const d =
+    curve === 0
+      ? `M ${from.cx} ${from.cy} L ${to.cx} ${to.cy}`
+      : `M ${from.cx} ${from.cy} Q ${(from.cx + to.cx) / 2} ${(from.cy + to.cy) / 2 - curve} ${to.cx} ${to.cy}`;
+  svg.appendChild(
+    createSvgElement("path", {
+      d,
+      class: `parallel-flow ${dashed ? "faint" : ""}`,
+      stroke: color,
+      "stroke-dasharray": dashed ? "8 8" : "",
+      "marker-end": "url(#parallel-arrow)",
+    }),
+  );
+}
+
+function drawParallelLegend(svg, items) {
+  const g = createSvgElement("g", { transform: "translate(70 510)" });
+  items.forEach((item, index) => {
+    const x = index * 168;
+    g.appendChild(createSvgElement("rect", { x, y: 0, width: 18, height: 18, rx: 4, fill: item.color }));
+    g.appendChild(createSvgElement("text", { x: x + 26, y: 14, class: "svg-small" }, item.label));
+  });
+  svg.appendChild(g);
+}
+
+function drawRingOnRanks(svg, tiles, ranks, color) {
+  ranks.forEach((rank, index) => {
+    drawParallelLine(svg, tiles[rank], tiles[ranks[(index + 1) % ranks.length]], color, true, index % 2 ? 18 : -18);
+  });
+}
+
+function drawParallelismSvg(key) {
+  const svg = els.parallelismSvg;
+  const tiles = parallelTiles();
+  clear(svg);
+  addParallelArrowDefs(svg);
+
+  svg.appendChild(createSvgElement("text", { x: 70, y: 44, class: "svg-label" }, parallelismDefinitions[key].label));
+  svg.appendChild(
+    createSvgElement("text", { x: 70, y: 68, class: "svg-small" }, "Sixteen ranks shown as a process-group mesh; colored boxes are communication or ownership groups."),
+  );
+
+  if (key === "data") {
+    drawParallelGroup(svg, tiles, tiles.map((tile) => tile.rank), "DP group: full model replicas", "#16817a", 16);
+    drawRingOnRanks(svg, tiles, tiles.map((tile) => tile.rank), "#16817a");
+    tiles.forEach((tile) => drawParallelTile(svg, tile, "full model", `batch ${tile.rank}`, "#16817a", "#f8fbfa"));
+    drawParallelLegend(svg, [
+      { color: "#16817a", label: "gradient all-reduce" },
+      { color: "#20252a", label: "replicated weights" },
+    ]);
+    return;
+  }
+
+  if (key === "fsdp") {
+    drawParallelGroup(svg, tiles, tiles.map((tile) => tile.rank), "sharded data-parallel group", "#7758a6", 16);
+    drawRingOnRanks(svg, tiles, tiles.map((tile) => tile.rank), "#7758a6");
+    tiles.forEach((tile) => drawParallelTile(svg, tile, `param shard ${tile.rank % 8}`, "AG before compute", "#7758a6", "#fbf9ff"));
+    drawParallelLegend(svg, [
+      { color: "#7758a6", label: "all-gather / reduce-scatter" },
+      { color: "#20252a", label: "logical DP semantics" },
+    ]);
+    return;
+  }
+
+  if (key === "tensor") {
+    for (let row = 0; row < 4; row++) {
+      const ranks = [0, 1, 2, 3].map((col) => row * 4 + col);
+      drawParallelGroup(svg, tiles, ranks, `TP group ${row}: split one layer`, chunkColors[row], 10);
+      ranks.slice(0, -1).forEach((rank) => drawParallelLine(svg, tiles[rank], tiles[rank + 1], chunkColors[row], true));
+    }
+    tiles.forEach((tile) => drawParallelTile(svg, tile, `W slice ${tile.col}`, `layer group ${tile.row}`, chunkColors[tile.row], "#f8fbfa"));
+    drawParallelLegend(svg, [
+      { color: "#16817a", label: "partial sums" },
+      { color: "#c4544f", label: "row/column shards" },
+      { color: "#7758a6", label: "same layer group" },
+    ]);
+    return;
+  }
+
+  if (key === "pipeline") {
+    for (let col = 0; col < 4; col++) {
+      const ranks = [0, 1, 2, 3].map((row) => row * 4 + col);
+      drawParallelGroup(svg, tiles, ranks, `PP stage ${col}`, chunkColors[col], 10);
+    }
+    for (let row = 0; row < 4; row++) {
+      for (let col = 0; col < 3; col++) {
+        drawParallelLine(svg, tiles[row * 4 + col], tiles[row * 4 + col + 1], "#bf7c21", false);
+      }
+    }
+    tiles.forEach((tile) => drawParallelTile(svg, tile, `layers ${tile.col}`, `microbatch lane ${tile.row}`, chunkColors[tile.col], "#fffaf3"));
+    drawParallelLegend(svg, [
+      { color: "#bf7c21", label: "activation send/recv" },
+      { color: "#20252a", label: "depth sharded by stage" },
+    ]);
+    return;
+  }
+
+  if (key === "expert") {
+    drawParallelGroup(svg, tiles, tiles.map((tile) => tile.rank), "EP group: experts distributed over ranks", "#c4544f", 16);
+    const router = { cx: 450, cy: 86 };
+    svg.appendChild(createSvgElement("rect", { x: 380, y: 60, width: 140, height: 40, rx: 8, fill: "#273033" }));
+    svg.appendChild(createSvgElement("text", { x: 450, y: 85, "text-anchor": "middle", fill: "#fff", "font-weight": 760 }, "router"));
+    [1, 3, 5, 8, 10, 12, 14].forEach((rank, index) => {
+      drawParallelLine(svg, router, tiles[rank], chunkColors[index], false, 28 + index * 2);
+    });
+    tiles.forEach((tile) => drawParallelTile(svg, tile, `expert ${tile.rank % 8}`, "token owner", "#c4544f", "#fff8f8"));
+    drawParallelLegend(svg, [
+      { color: "#c4544f", label: "expert weights" },
+      { color: "#16817a", label: "token dispatch" },
+      { color: "#7758a6", label: "combine outputs" },
+    ]);
+    return;
+  }
+
+  if (key === "expertData") {
+    const top = Array.from({ length: 8 }, (_, i) => i);
+    const bottom = Array.from({ length: 8 }, (_, i) => i + 8);
+    drawParallelGroup(svg, tiles, top, "EP group A / data replica 0", "#c4544f", 13);
+    drawParallelGroup(svg, tiles, bottom, "EP group B / data replica 1", "#2f7fa4", 13);
+    for (let i = 0; i < 8; i++) {
+      drawParallelLine(svg, tiles[i], tiles[i + 8], "#5b8c3a", true);
+    }
+    [...top, ...bottom].forEach((rank) => {
+      const tile = tiles[rank];
+      const color = rank < 8 ? "#c4544f" : "#2f7fa4";
+      drawParallelTile(svg, tile, `expert ${rank % 8}`, `replica ${rank < 8 ? 0 : 1}`, color, rank < 8 ? "#fff8f8" : "#f5fbff");
+    });
+    drawParallelLegend(svg, [
+      { color: "#c4544f", label: "expert group A" },
+      { color: "#2f7fa4", label: "expert group B" },
+      { color: "#5b8c3a", label: "matching expert grad sync" },
+    ]);
+    return;
+  }
+
+  const topReplica = Array.from({ length: 8 }, (_, i) => i);
+  const bottomReplica = Array.from({ length: 8 }, (_, i) => i + 8);
+  drawParallelGroup(svg, tiles, topReplica, "DP replica 0: TP x PP x EP submesh", "#16817a", 15);
+  drawParallelGroup(svg, tiles, bottomReplica, "DP replica 1: matching submesh", "#7758a6", 15);
+  [0, 1, 2, 3].forEach((col) => {
+    drawParallelLine(svg, tiles[col], tiles[col + 4], "#bf7c21", false);
+    drawParallelLine(svg, tiles[col + 8], tiles[col + 12], "#bf7c21", false);
+  });
+  [0, 2, 8, 10].forEach((rank) => drawParallelLine(svg, tiles[rank], tiles[rank + 1], "#2f7fa4", true));
+  [4, 6, 12, 14].forEach((rank) => drawParallelLine(svg, tiles[rank], tiles[rank + 1], "#c4544f", true));
+  tiles.forEach((tile) => {
+    const dp = tile.row < 2 ? 0 : 1;
+    const pp = tile.row % 2;
+    const tp = tile.col % 2;
+    const ep = tile.col < 2 ? 0 : 1;
+    drawParallelTile(svg, tile, `DP${dp} PP${pp}`, `TP${tp} EP${ep}`, dp === 0 ? "#16817a" : "#7758a6", "#f9fbfa");
+  });
+  drawParallelLegend(svg, [
+    { color: "#16817a", label: "data replica" },
+    { color: "#2f7fa4", label: "TP collectives" },
+    { color: "#bf7c21", label: "PP activation path" },
+    { color: "#c4544f", label: "EP token path" },
+  ]);
+}
+
+function renderParallelismMetrics(metrics) {
+  clear(els.parallelismMetrics);
+  metrics.forEach(([label, value]) => {
+    const metric = document.createElement("div");
+    metric.className = "metric";
+    const span = document.createElement("span");
+    span.textContent = label;
+    const strong = document.createElement("strong");
+    strong.textContent = value;
+    metric.append(span, strong);
+    els.parallelismMetrics.appendChild(metric);
+  });
+}
+
+function renderParallelism() {
+  if (!els.parallelismSvg) return;
+  const def = parallelismDefinitions[state.parallelism];
+  els.parallelismTitle.textContent = def.label;
+  els.parallelismSummary.textContent = def.summary;
+  els.parallelismCommunication.textContent = def.communication;
+  els.parallelismFit.textContent = def.fit;
+  renderParallelismMetrics(def.metrics);
+  drawParallelismSvg(state.parallelism);
+}
+
+function initParallelismControls() {
+  if (!els.parallelismSelect) return;
+  Object.entries(parallelismDefinitions).forEach(([value, def]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = def.label;
+    els.parallelismSelect.appendChild(option);
+  });
+  els.parallelismSelect.value = state.parallelism;
+  els.parallelismSelect.addEventListener("change", () => {
+    state.parallelism = els.parallelismSelect.value;
+    renderParallelism();
+  });
+}
+
 initControls();
+initParallelismControls();
 renderHeroNetwork();
 renderTopology();
+renderParallelism();
 renderSimulator();

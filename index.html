@@ -22,6 +22,7 @@
         <a href="#visualizer">Visualizer</a>
         <a href="#collectives">Collectives</a>
         <a href="#nccl">NCCL</a>
+        <a href="#parallelism">Parallelism</a>
         <a href="#training">Training</a>
         <a href="#debugging">Debugging</a>
       </nav>
@@ -49,8 +50,8 @@
               <span>algorithm families</span>
             </div>
             <div>
-              <strong>6</strong>
-              <span>training workflows</span>
+              <strong>7</strong>
+              <span>parallelism strategies</span>
             </div>
           </div>
         </div>
@@ -396,6 +397,173 @@
         </div>
       </section>
 
+      <section id="parallelism" class="section-pad section-band">
+        <div class="section-intro wide">
+          <p class="eyebrow">Ownership axes</p>
+          <h2>How data, tensor, pipeline, and expert parallelism relate</h2>
+          <p>
+            Parallelism is a choice about what is repeated and what is split.
+            Real large-model training usually uses a Cartesian product of
+            process groups: data parallel groups replicate training examples,
+            tensor parallel groups split layer math, pipeline groups split
+            depth, and expert groups split sparse MoE capacity.
+          </p>
+        </div>
+
+        <div class="parallelism-shell">
+          <div class="parallelism-main">
+            <div class="parallelism-toolbar">
+              <label>
+                Strategy view
+                <select id="parallelism-select"></select>
+              </label>
+              <div class="parallelism-equation" aria-label="World size decomposition">
+                <span>world size</span>
+                <strong>DP x TP x PP x CP x EP</strong>
+              </div>
+            </div>
+            <svg id="parallelism-svg" viewBox="0 0 900 580" role="img" aria-labelledby="parallel-title parallel-desc">
+              <title id="parallel-title">Parallelism strategy diagram</title>
+              <desc id="parallel-desc">
+                A sixteen GPU grid showing how different parallelism strategies
+                group ranks and move tensors, activations, gradients, or tokens.
+              </desc>
+            </svg>
+          </div>
+          <aside class="parallelism-aside">
+            <div>
+              <p class="eyebrow">Selected strategy</p>
+              <h3 id="parallelism-title">Loading</h3>
+              <p id="parallelism-summary" class="detail-text"></p>
+            </div>
+            <div class="metric-grid" id="parallelism-metrics"></div>
+            <div>
+              <p class="eyebrow">Main communication</p>
+              <p id="parallelism-communication" class="detail-text"></p>
+            </div>
+            <div>
+              <p class="eyebrow">When it is useful</p>
+              <p id="parallelism-fit" class="detail-text"></p>
+            </div>
+          </aside>
+        </div>
+
+        <div class="parallelism-map">
+          <article>
+            <span>DP</span>
+            <h3>Data parallel</h3>
+            <p>
+              Replicate the model over different data shards. Dense DDP syncs
+              gradients with all-reduce; sharded DP/FSDP replaces that with
+              reduce-scatter and all-gather.
+            </p>
+          </article>
+          <article>
+            <span>TP</span>
+            <h3>Tensor parallel</h3>
+            <p>
+              Split matrices and layer activations inside a layer. It reduces
+              per-rank layer memory, but introduces collectives inside the
+              forward and backward passes.
+            </p>
+          </article>
+          <article>
+            <span>PP</span>
+            <h3>Pipeline parallel</h3>
+            <p>
+              Split consecutive layers into stages. Microbatches flow through
+              stages, trading activation traffic and scheduling bubbles for
+              lower per-rank model memory.
+            </p>
+          </article>
+          <article>
+            <span>EP</span>
+            <h3>Expert parallel</h3>
+            <p>
+              Split MoE experts across ranks. Router-selected tokens move to
+              their expert owners, usually with all-to-all style dispatch and
+              combine phases.
+            </p>
+          </article>
+          <article>
+            <span>EDP</span>
+            <h3>Expert data parallel</h3>
+            <p>
+              Replicate expert-parallel groups across data-parallel replicas.
+              Matching experts across replicas synchronize their gradients,
+              while tokens only route inside each expert group.
+            </p>
+          </article>
+          <article>
+            <span>CP/SP</span>
+            <h3>Context and sequence axes</h3>
+            <p>
+              Split sequence-length or selected activation dimensions. These
+              axes complement TP and are useful when long contexts make
+              activations, attention, or KV-like state dominate memory.
+            </p>
+          </article>
+        </div>
+
+        <div class="relationship-table" role="table" aria-label="Parallelism relationship table">
+          <div class="relationship-row relationship-head" role="row">
+            <div role="columnheader">Strategy</div>
+            <div role="columnheader">Replicated</div>
+            <div role="columnheader">Sharded</div>
+            <div role="columnheader">Collectives or traffic</div>
+            <div role="columnheader">Combines naturally with</div>
+          </div>
+          <div class="relationship-row" role="row">
+            <div role="cell"><strong>DDP</strong></div>
+            <div role="cell">Full model and optimizer state</div>
+            <div role="cell">Data batch</div>
+            <div role="cell">Gradient all-reduce</div>
+            <div role="cell">TP, PP, EP, CP, activation checkpointing</div>
+          </div>
+          <div class="relationship-row" role="row">
+            <div role="cell"><strong>FSDP / ZeRO</strong></div>
+            <div role="cell">Logical training semantics</div>
+            <div role="cell">Parameters, gradients, optimizer state</div>
+            <div role="cell">All-gather parameters, reduce-scatter gradients</div>
+            <div role="cell">TP for large layers, PP for depth, DP for throughput</div>
+          </div>
+          <div class="relationship-row" role="row">
+            <div role="cell"><strong>Tensor parallel</strong></div>
+            <div role="cell">Layer definition and batch assignment</div>
+            <div role="cell">Weight matrices, activations, partial sums</div>
+            <div role="cell">All-reduce, all-gather, reduce-scatter</div>
+            <div role="cell">DP across nodes, PP across stages, SP for activations</div>
+          </div>
+          <div class="relationship-row" role="row">
+            <div role="cell"><strong>Pipeline parallel</strong></div>
+            <div role="cell">Usually stage code within a DP replica</div>
+            <div role="cell">Model depth</div>
+            <div role="cell">Point-to-point activations and gradients</div>
+            <div role="cell">TP within a stage, DP across full pipelines</div>
+          </div>
+          <div class="relationship-row" role="row">
+            <div role="cell"><strong>Expert parallel</strong></div>
+            <div role="cell">Dense layers unless also using TP/FSDP</div>
+            <div role="cell">MoE expert weights and token workload</div>
+            <div role="cell">All-to-all token dispatch and combine</div>
+            <div role="cell">EDP, TP/ETP, PP, grouped GEMM, token balancing</div>
+          </div>
+        </div>
+
+        <div class="dimension-note">
+          <h3>How to read a hybrid layout</h3>
+          <p>
+            A rank can be in one group for each axis at the same time. For
+            example, `TP=2, PP=4, EP=8, DP=2` on 128 GPUs means each data
+            replica contains a model-parallel submesh of `2 x 4 x 8 = 64`
+            ranks, and there are two replicas that synchronize the trainable
+            state they both own. Increasing one model-parallel dimension usually
+            shrinks the available data-parallel dimension unless the world size
+            also grows.
+          </p>
+        </div>
+      </section>
+
       <section id="training" class="section-pad section-band">
         <div class="section-intro wide">
           <p class="eyebrow">Training systems</p>
@@ -639,6 +807,24 @@ grad /= dist.get_world_size()</code></pre>
           </a>
           <a href="https://docs.pytorch.org/docs/stable/notes/ddp.html">
             PyTorch DistributedDataParallel Notes
+          </a>
+          <a href="https://docs.nvidia.com/nemo/megatron-bridge/latest/parallelisms.html">
+            NVIDIA Megatron Bridge: Parallelisms Guide
+          </a>
+          <a href="https://docs.nvidia.com/megatron-core/developer-guide/0.16.0/user-guide/parallelism-guide.html">
+            NVIDIA Megatron Core: Parallelism Strategies Guide
+          </a>
+          <a href="https://docs.pytorch.org/docs/stable/distributed.tensor.parallel.html">
+            PyTorch Tensor Parallelism API
+          </a>
+          <a href="https://docs.pytorch.org/docs/stable/distributed.pipelining.html">
+            PyTorch Pipeline Parallelism
+          </a>
+          <a href="https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html">
+            PyTorch FSDP2 Tutorial
+          </a>
+          <a href="https://www.deepspeed.ai/tutorials/mixture-of-experts/">
+            DeepSpeed Mixture-of-Experts Tutorial
           </a>
         </div>
       </section>

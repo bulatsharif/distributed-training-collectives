@@ -15,6 +15,9 @@ Open `http://localhost:8000`.
 
 - Interactive simulator for AllReduce, ReduceScatter, AllGather, Broadcast,
   Reduce, AllToAll, Gather, Scatter, and Barrier.
+- Interactive 16-rank visualization of data parallelism, FSDP/ZeRO-style
+  sharded data parallelism, tensor parallelism, pipeline parallelism, expert
+  parallelism, expert data parallelism, and hybrid 3D + expert layouts.
 - NCCL execution model, topology, transports, channels, protocols, and group
   calls.
 - Distributed-training communication patterns for DDP, FSDP/ZeRO, tensor
